@@ -9,11 +9,15 @@
 #include <math.h>
 
 // Tambahan
-#include <RTClib.h>       // RTC DS1307
+#include <RTClib.h>       // RTC DS3231
 #include <SD.h>           // microSD
 #include <SPI.h>
 #include <ArduinoOTA.h>   // OTA via WiFi
 #include <sys/time.h>     // settimeofday()
+#include <SPIFFS.h>
+#include <Update.h>
+#include <IRremoteESP8266.h>
+#include <IRsend.h>
 
 // ====== PIN & TIPE SENSOR ======
 #define DHTPIN 4
@@ -48,12 +52,349 @@ DHT dht(DHTPIN, DHTTYPE);
 BH1750 lightMeter;
 
 // ====== RTC & microSD ======
-RTC_DS1307 rtc;
+RTC_DS3231 rtc;
 const int SD_CS = 5;                 // Ubah sesuai modul microSD
 const char* DAILY_CSV = "/weather_daily.csv";
 
 // ====== Web server ======
 WebServer server(80);
+
+// ====== IR Remote (gabungan irtx.ino) ======
+struct IrScheduleItem {
+  String timeStr;   // "22:00"
+  String keysStr;   // "25,NIGHT_ON"
+};
+
+uint16_t irInterFrameDelayMs = 40;  // default 40ms antar frame IR
+
+const int IR_MAX_SCHEDULES = 10;
+IrScheduleItem irSchedules[IR_MAX_SCHEDULES];
+int irScheduleCount = 0;
+
+int irLastCheckedMinute = -1;
+
+// IR SEND
+const uint16_t IR_LED_PIN = 23;  // KY-005 -> pin S lewat resistor 220R dari GPIO23, pin - ke GND
+IRsend irsend(IR_LED_PIN);
+
+// STRUKTUR DATA KODE
+struct IrCode {
+  String key;   // misal "25", "26", "OFF"
+  String raw;   // "4436,4344,558,1592,..."
+};
+
+const int IR_MAX_CODES = 20;
+IrCode irCodes[IR_MAX_CODES];
+int irCodeCount = 0;
+
+// UTIL: PARSE RAW STRING
+bool irSendOneRaw(const String &rawStr) {
+  const int MAX_PULSES = 2000;
+  uint16_t buf[MAX_PULSES];
+  int len = 0;
+
+  int start = 0;
+  while (start < rawStr.length()) {
+    int comma = rawStr.indexOf(',', start);
+    String token;
+    if (comma == -1) {
+      token = rawStr.substring(start);
+      start = rawStr.length();
+    } else {
+      token = rawStr.substring(start, comma);
+      start = comma + 1;
+    }
+    token.trim();
+    if (token.length() == 0) continue;
+    long val = token.toInt();
+    if (val <= 0) continue;
+    if (len >= MAX_PULSES) break;
+    buf[len++] = (uint16_t)val;
+  }
+
+  if (len == 0) return false;
+
+  Serial.print(F("Mengirim 1 frame IR, len="));
+  Serial.println(len);
+  irsend.sendRaw(buf, len, 38); // 38 kHz
+  return true;
+}
+
+bool irSendMultiRaw(const String &rawMulti) {
+  // rawMulti contoh: "4436,...,580|502,...,570"
+  int start = 0;
+  bool ok = false;
+
+  while (start < rawMulti.length()) {
+    int sep = rawMulti.indexOf('|', start);
+    String part;
+    if (sep == -1) {
+      part = rawMulti.substring(start);
+      start = rawMulti.length();
+    } else {
+      part = rawMulti.substring(start, sep);
+      start = sep + 1;
+    }
+    part.trim();
+    if (part.length() == 0) continue;
+
+    if (irSendOneRaw(part)) {
+      ok = true;
+      if (irInterFrameDelayMs > 0) {
+        delay(irInterFrameDelayMs);   // delay antar frame dari setting
+      }
+    }
+  }
+  return ok;
+}
+
+// FILE: LOAD & SAVE
+void irLoadCodes() {
+  irCodeCount = 0;
+  if (!SPIFFS.exists("/codes.txt")) {
+    Serial.println(F("codes.txt belum ada, membuat default."));
+    File f = SPIFFS.open("/codes.txt", FILE_WRITE);
+    if (!f) {
+      Serial.println(F("Gagal membuat codes.txt"));
+      return;
+    }
+    f.println("25:");
+    f.println("26:");
+    f.close();
+  }
+
+  File f = SPIFFS.open("/codes.txt", FILE_READ);
+  if (!f) {
+    Serial.println(F("Gagal membuka codes.txt"));
+    return;
+  }
+
+  Serial.println(F("Memuat codes.txt:"));
+  while (f.available() && irCodeCount < IR_MAX_CODES) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    int sep = line.indexOf(':');
+    if (sep == -1) continue;
+    String key = line.substring(0, sep);
+    String raw = line.substring(sep + 1);
+    key.trim();
+    raw.trim();
+    irCodes[irCodeCount].key = key;
+    irCodes[irCodeCount].raw = raw;
+    Serial.print("  key=");
+    Serial.print(key);
+    Serial.print(" raw len=");
+    Serial.println(raw.length());
+    irCodeCount++;
+  }
+  f.close();
+}
+
+void irSaveCodes() {
+  File f = SPIFFS.open("/codes.txt", FILE_WRITE);
+  if (!f) {
+    Serial.println(F("Gagal menulis codes.txt"));
+    return;
+  }
+  for (int i = 0; i < irCodeCount; i++) {
+    if (irCodes[i].key.length() == 0) continue;
+    f.print(irCodes[i].key);
+    f.print(":");
+    f.println(irCodes[i].raw);
+  }
+  f.close();
+  Serial.println(F("codes.txt tersimpan."));
+}
+
+// Cari kode berdasarkan key
+int irFindCodeIndex(const String &key) {
+  for (int i = 0; i < irCodeCount; i++) {
+    if (irCodes[i].key == key) return i;
+  }
+  return -1;
+}
+
+// Tambah atau update kode
+void irUpsertCode(const String &key, const String &raw) {
+  int idx = irFindCodeIndex(key);
+  if (idx == -1) {
+    if (irCodeCount >= IR_MAX_CODES) {
+      Serial.println(F("Slot kode sudah penuh."));
+      return;
+    }
+    idx = irCodeCount++;
+  }
+  irCodes[idx].key = key;
+  irCodes[idx].raw = raw;
+  Serial.print(F("Kode disimpan: "));
+  Serial.print(key);
+  Serial.print(F(" len raw="));
+  Serial.println(raw.length());
+  irSaveCodes();
+}
+
+// Hapus kode berdasarkan key
+bool irDeleteCode(const String &key) {
+  int idx = irFindCodeIndex(key);
+  if (idx == -1) return false;
+
+  for (int i = idx; i < irCodeCount - 1; i++) {
+    irCodes[i] = irCodes[i + 1];
+  }
+  irCodeCount--;
+  if (irCodeCount < 0) irCodeCount = 0;
+
+  irSaveCodes();
+  Serial.print(F("Kode dihapus: "));
+  Serial.println(key);
+  return true;
+}
+
+void irLoadSettings() {
+  if (!SPIFFS.exists("/settings.txt")) {
+    return; // pakai default
+  }
+
+  File f = SPIFFS.open("/settings.txt", FILE_READ);
+  if (!f) return;
+
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (!line.length()) continue;
+
+    int eq = line.indexOf('=');
+    if (eq == -1) continue;
+
+    String key = line.substring(0, eq);
+    String val = line.substring(eq + 1);
+    key.trim();
+    val.trim();
+
+    if (key == "ir_delay_ms") {
+      int v = val.toInt();
+      if (v < 0) v = 0;
+      if (v > 500) v = 500; // batasi 0–500 ms
+      irInterFrameDelayMs = (uint16_t)v;
+      Serial.print(F("Load irInterFrameDelayMs = "));
+      Serial.println(irInterFrameDelayMs);
+    }
+  }
+
+  f.close();
+}
+
+void irSaveSettings() {
+  File f = SPIFFS.open("/settings.txt", FILE_WRITE);
+  if (!f) {
+    Serial.println(F("Gagal buka /settings.txt untuk write"));
+    return;
+  }
+  f.print("ir_delay_ms=");
+  f.println(irInterFrameDelayMs);
+  f.close();
+  Serial.print(F("Settings disimpan. irInterFrameDelayMs = "));
+  Serial.println(irInterFrameDelayMs);
+}
+
+void irLoadSchedules() {
+  irScheduleCount = 0;
+  if (!SPIFFS.exists("/schedules.txt")) {
+    File f = SPIFFS.open("/schedules.txt", FILE_WRITE);
+    if (f) {
+      f.close();
+    }
+    return;
+  }
+
+  File f = SPIFFS.open("/schedules.txt", FILE_READ);
+  if (!f) return;
+
+  while (f.available() && irScheduleCount < IR_MAX_SCHEDULES) {
+    String line = f.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    int eq = line.indexOf('=');
+    if (eq == -1) continue;
+    irSchedules[irScheduleCount].timeStr = line.substring(0, eq);
+    irSchedules[irScheduleCount].keysStr = line.substring(eq + 1);
+    irSchedules[irScheduleCount].timeStr.trim();
+    irSchedules[irScheduleCount].keysStr.trim();
+    irScheduleCount++;
+  }
+  f.close();
+}
+
+void irSaveSchedules() {
+  File f = SPIFFS.open("/schedules.txt", FILE_WRITE);
+  if (!f) return;
+  for (int i = 0; i < irScheduleCount; i++) {
+    if (irSchedules[i].timeStr.length() == 0) continue;
+    f.print(irSchedules[i].timeStr);
+    f.print("=");
+    f.println(irSchedules[i].keysStr);
+  }
+  f.close();
+}
+
+void irRunSchedulesIfDue() {
+  time_t now = time(nullptr);
+  struct tm timeinfo;
+  localtime_r(&now, &timeinfo);
+
+  int currentMinute = timeinfo.tm_hour * 60 + timeinfo.tm_min;
+  if (currentMinute == irLastCheckedMinute) {
+    return; // sudah dicek menit ini
+  }
+  irLastCheckedMinute = currentMinute;
+
+  char buf[6];
+  sprintf(buf, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+  String nowStr(buf);
+
+  Serial.print(F("Cek schedule untuk "));
+  Serial.println(nowStr);
+
+  for (int i = 0; i < irScheduleCount; i++) {
+    if (irSchedules[i].timeStr == nowStr) {
+      Serial.print(F("Schedule match: "));
+      Serial.print(irSchedules[i].timeStr);
+      Serial.print(" => ");
+      Serial.println(irSchedules[i].keysStr);
+
+      String keys = irSchedules[i].keysStr;
+      int start = 0;
+      while (start < keys.length()) {
+        int comma = keys.indexOf(',', start);
+        String key;
+        if (comma == -1) {
+          key = keys.substring(start);
+          start = keys.length();
+        } else {
+          key = keys.substring(start, comma);
+          start = comma + 1;
+        }
+        key.trim();
+        if (key.length() == 0) continue;
+
+        int idx = irFindCodeIndex(key);
+        if (idx == -1 || irCodes[idx].raw.length() == 0) {
+          Serial.print(F("  Key tidak ditemukan / kosong: "));
+          Serial.println(key);
+          continue;
+        }
+
+        Serial.print(F("  Kirim key: "));
+        Serial.println(key);
+        if (!irSendMultiRaw(irCodes[idx].raw)) {
+          Serial.println(F("  Gagal kirim raw untuk key ini"));
+        }
+        delay(40); // jeda antar key
+      }
+    }
+  }
+}
 
 // ====== Variabel data (terbaru) ======
 float temp_bme = NAN, hum_bme = NAN, pres_bme = NAN, alt_bme = NAN;
@@ -575,9 +916,386 @@ void handleDailyCSV(){
   f.close();
 }
 
+// ---------- IR HTTP Handlers ----------
+void handleIrRoot() {
+  String editKey = "";
+  String editRaw = "";
+  if (server.hasArg("edit")) {
+    editKey = server.arg("edit");
+    int idx = irFindCodeIndex(editKey);
+    if (idx != -1) {
+      editRaw = irCodes[idx].raw;
+    }
+  }
+
+  String html;
+  html += F("<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 AC IR</title>");
+  html += F("<script>"
+          "function sendIr(key){"
+          "  fetch('ac?key=' + encodeURIComponent(key))"
+          "    .then(r => r.text())"
+          "    .then(t => {"
+          "      console.log('IR sent for key:', key);"
+          "      const s = document.getElementById('status');"
+          "      if(s){s.textContent = 'IR terkirim untuk ' + key + ' (' + new Date().toLocaleTimeString() + ')';}"
+          "    })"
+          "    .catch(e => console.error(e));"
+          "  return false;"
+          "}"
+          "</script>");
+  html += F("<style>"
+            "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#020617;color:#e5e7eb;margin:0;padding:16px;}"
+            ".wrap{max-width:900px;margin:0 auto;}"
+            ".card{background:#020617;border-radius:18px;padding:20px;box-shadow:0 20px 40px rgba(0,0,0,.6);border:1px solid #1f2937;}"
+            "h1{font-size:22px;margin:0 0 4px;}"
+            "h2{font-size:18px;margin:16px 0 8px;}"
+            "p{font-size:14px;color:#9ca3af;}"
+            "table{width:100%;border-collapse:collapse;margin-top:8px;font-size:13px;}"
+            "th,td{text-align:left;padding:6px 4px;border-bottom:1px solid #1f2937;}"
+            "th{color:#9ca3af;font-weight:500;font-size:12px;text-transform:uppercase;letter-spacing:.04em;}"
+            ".badge{display:inline-block;padding:2px 10px;border-radius:999px;background:#111827;color:#e5e7eb;font-size:11px;}"
+            ".btn{display:inline-block;padding:6px 10px;border-radius:999px;text-decoration:none;font-size:12px;margin:0 3px 3px 0;}"
+            ".btn-primary{background:#22c55e;color:#022c22;}"
+            ".btn-secondary{background:#0ea5e9;color:#e0f2fe;}"
+            ".btn-danger{background:#ef4444;color:#fef2f2;}"
+            "label{display:block;font-size:12px;color:#9ca3af;margin-top:8px;margin-bottom:2px;}"
+            "input,textarea{width:100%;max-width:100%;border-radius:10px;border:none;padding:8px 10px;margin:0 0 8px;background:#020617;color:#e5e7eb;box-shadow:0 0 0 1px #1f2937 inset;font-size:13px;}"
+            "input:focus,textarea:focus{outline:none;box-shadow:0 0 0 1px #38bdf8 inset;}"
+            "button{border:none;border-radius:999px;padding:8px 14px;background:#22c55e;color:#022c22;font-size:13px;cursor:pointer;margin-top:4px;}"
+            "button:hover{filter:brightness(1.1);}"
+            ".grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(0,1.5fr);gap:18px;margin-top:18px;}"
+            "@media(max-width:768px){.grid{grid-template-columns:1fr;}}"
+            "small{color:#6b7280;font-size:11px;}"
+            "</style></head><body><div class='wrap'><div class='card'>");
+
+  html += F("<h1>ESP32 AC IR Controller</h1>");
+  html += F("<p>Kelola tombol IR (suhu, OFF, mode, dsb.) langsung dari web, tanpa flash ulang.</p>");
+  html += F("<p><a class='btn btn-secondary' href='/'>Weather Dashboard</a> <a class='btn btn-secondary' href='update'>Firmware Update (OTA)</a></p>");
+
+  html += F("<div class='grid'>");
+
+  html += F("<div>");
+  html += F("<h2>Daftar Tombol</h2>");
+  if (irCodeCount == 0) {
+    html += F("<p><i>Belum ada kode tersimpan.</i></p>");
+  } else {
+    html += F("<table><thead><tr><th>Key</th><th>Panjang Raw</th><th>Aksi</th></tr></thead><tbody>");
+    for (int i = 0; i < irCodeCount; i++) {
+      html += F("<tr><td><span class='badge'>");
+      html += irCodes[i].key;
+      html += F("</span></td><td><small>");
+      html += String(irCodes[i].raw.length());
+      html += F(" chars</small></td><td>");
+      html += F("<button class='btn btn-primary' onclick=\"return sendIr('");
+      html += irCodes[i].key;
+      html += F("');\">Kirim</button>");
+      html += F("<a class='btn btn-secondary' href='?edit=");
+      html += irCodes[i].key;
+      html += F("'>Edit</a>");
+      html += F("<a class='btn btn-danger' href='delete?key=");
+      html += irCodes[i].key;
+      html += F("' onclick=\"return confirm('Hapus key ");
+      html += irCodes[i].key;
+      html += F(" ?');\">Hapus</a>");
+      html += F("</td></tr>");
+    }
+    html += F("</tbody></table>");
+    html += F("<p id='status'><small>Siap mengirim IR.</small></p>");
+  }
+  html += F("<p><small>Akses cepat juga tersedia: /ir/ac?temp=25, /ir/ac?temp=26, dll (menggunakan key yang sama).</small></p>");
+  html += F("</div>");
+
+  html += F("<div>");
+  html += F("<h2>Tambah / Ubah Kode</h2>");
+  html += F("<form method='POST' action='save'>");
+  html += F("<label>Key (misal 25, 26, OFF, COOL):</label>");
+  html += F("<input name='key' value='");
+  if (editKey.length() > 0) {
+    html += editKey;
+  }
+  html += F("'>");
+
+  html += F("<label>Raw data (angka µs dipisah koma):</label>");
+  html += F("<textarea name='raw' rows='8' cols='50'>");
+  if (editRaw.length() > 0) {
+    String rawDisplay = editRaw;
+    rawDisplay.replace('|', '\n');
+    html += rawDisplay;
+  }
+  html += F("</textarea>");
+
+  html += F("<button type='submit'>Simpan Kode</button>");
+  html += F("<p><small>Tempel rawData dari Serial Monitor, misalnya nilai di dalam <code>rawData[]</code> tanpa tanda kurung kurawal.</small></p>");
+  html += F("</form>");
+
+  html += F("<form method='POST' action='savesettings'>");
+  html += F("<label>Delay antar frame (ms):</label><br>");
+  html += F("<input type='number' name='delay' min='0' max='500' value='");
+  html += String(irInterFrameDelayMs);
+  html += F("' style='width:100px;padding:4px;margin:4px 0;border-radius:8px;border:1px solid #1f2937;background:#020617;color:#e5e7eb;'>");
+  html += F("<br><button type='submit' class='btn btn-primary'>Simpan Delay</button>");
+  html += F("</form>");
+
+  html += F("</div>");
+
+  html += F("<hr><h2>Schedule Otomatis</h2>");
+
+  if (irScheduleCount == 0) {
+    html += F("<p><i>Belum ada schedule.</i></p>");
+  } else {
+    html += F("<ul>");
+    for (int i = 0; i < irScheduleCount; i++) {
+      html += F("<li><span class='badge'>");
+      html += irSchedules[i].timeStr;
+      html += F("</span> &mdash; ");
+      html += irSchedules[i].keysStr;
+      html += F(" <a class='btn btn-danger' href='delsched?i=");
+      html += String(i);
+      html += F("'>Hapus</a></li>");
+    }
+    html += F("</ul>");
+  }
+
+  html += F("<h3>Tambah Schedule</h3>");
+  html += F("<form method='POST' action='savesched'>");
+  html += F("Jam (HH:MM, 24 jam):<br><input name='time' placeholder='22:00'><br>");
+  html += F("Keys (dipisah koma, misal: 25,NIGHT_ON):<br><input name='keys' placeholder='25,NIGHT_ON'><br>");
+  html += F("<button type='submit'>Simpan Schedule</button>");
+  html += F("</form>");
+
+  html += F("</div></div></body></html>");
+
+  server.send(200, "text/html", html);
+}
+
+void handleIrAc() {
+  String key;
+  if (server.hasArg("temp")) {
+    key = server.arg("temp");
+  } else if (server.hasArg("key")) {
+    key = server.arg("key");
+  } else {
+    server.send(400, "text/plain", "Parameter 'key' atau 'temp' diperlukan, contoh: /ir/ac?temp=25");
+    return;
+  }
+
+  key.trim();
+  int idx = irFindCodeIndex(key);
+  if (idx == -1 || irCodes[idx].raw.length() == 0) {
+    server.send(404, "text/plain", "Kode untuk key '" + key + "' tidak ditemukan atau kosong.");
+    return;
+  }
+
+  Serial.print(F("Request kirim key="));
+  Serial.println(key);
+
+  if (!irSendMultiRaw(irCodes[idx].raw)) {
+    server.send(500, "text/plain", "Gagal parsing raw data untuk key " + key);
+    return;
+  }
+
+  server.send(200, "text/plain", "IR terkirim untuk key " + key);
+}
+
+void handleIrSave() {
+  if (!server.hasArg("key") || !server.hasArg("raw")) {
+    server.send(400, "text/plain", "Butuh 'key' dan 'raw'.");
+    return;
+  }
+  String key = server.arg("key");
+  String raw = server.arg("raw");
+  key.trim();
+  raw.trim();
+  if (key.length() == 0 || raw.length() == 0) {
+    server.send(400, "text/plain", "Key dan raw tidak boleh kosong.");
+    return;
+  }
+
+  raw.replace("\r\n", "\n");
+  raw.replace('\r', '\n');
+  while (raw.indexOf("\n\n") != -1) {
+    raw.replace("\n\n", "\n");
+  }
+  raw.replace('\n', '|');
+  irUpsertCode(key, raw);
+  server.sendHeader("Location", "/ir?edit=" + key);
+  server.send(303);
+}
+
+void handleIrDelete() {
+  if (!server.hasArg("key")) {
+    server.send(400, "text/plain", "Parameter 'key' diperlukan, contoh: /ir/delete?key=25");
+    return;
+  }
+  String key = server.arg("key");
+  key.trim();
+  if (key.length() == 0) {
+    server.send(400, "text/plain", "Key tidak boleh kosong.");
+    return;
+  }
+
+  if (!irDeleteCode(key)) {
+    server.send(404, "text/plain", "Key '" + key + "' tidak ditemukan.");
+    return;
+  }
+
+  server.sendHeader("Location", "/ir");
+  server.send(303);
+}
+
+void handleIrSaveSchedule() {
+  if (!server.hasArg("time") || !server.hasArg("keys")) {
+    server.send(400, "text/plain", "Butuh 'time' dan 'keys'.");
+    return;
+  }
+  String t = server.arg("time");
+  String k = server.arg("keys");
+  t.trim();
+  k.trim();
+  if (t.length() == 0 || k.length() == 0) {
+    server.send(400, "text/plain", "Time dan keys tidak boleh kosong.");
+    return;
+  }
+  if (irScheduleCount >= IR_MAX_SCHEDULES) {
+    server.send(400, "text/plain", "Slot schedule penuh.");
+    return;
+  }
+  irSchedules[irScheduleCount].timeStr = t;
+  irSchedules[irScheduleCount].keysStr = k;
+  irScheduleCount++;
+  irSaveSchedules();
+  server.sendHeader("Location", "/ir");
+  server.send(303);
+}
+
+void handleIrDeleteSchedule() {
+  if (!server.hasArg("i")) {
+    server.send(400, "text/plain", "Parameter 'i' diperlukan.");
+    return;
+  }
+  int idx = server.arg("i").toInt();
+  if (idx < 0 || idx >= irScheduleCount) {
+    server.send(404, "text/plain", "Index schedule tidak valid.");
+    return;
+  }
+  for (int i = idx; i < irScheduleCount - 1; i++) {
+    irSchedules[i] = irSchedules[i + 1];
+  }
+  irScheduleCount--;
+  if (irScheduleCount < 0) irScheduleCount = 0;
+  irSaveSchedules();
+  server.sendHeader("Location", "/ir");
+  server.send(303);
+}
+
+void handleIrSaveSettings() {
+  if (server.hasArg("delay")) {
+    int v = server.arg("delay").toInt();
+    if (v < 0) v = 0;
+    if (v > 500) v = 500;
+    irInterFrameDelayMs = (uint16_t)v;
+    irSaveSettings();
+  }
+  server.sendHeader("Location", "/ir");
+  server.send(303);
+}
+
+void handleIrUpdatePage() {
+  String html;
+  html += F(
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>OTA Update</title>"
+    "<style>"
+    "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#020617;color:#e5e7eb;margin:0;padding:16px;}"
+    ".card{max-width:500px;margin:0 auto;background:#020617;border-radius:18px;padding:20px;box-shadow:0 20px 40px rgba(0,0,0,.6);border:1px solid #1f2937;}"
+    "h2{margin:0 0 8px;font-size:20px;}"
+    "p{font-size:13px;color:#9ca3af;}"
+    "input[type=file]{width:100%;margin-top:8px;padding:8px 10px;border-radius:12px;border:none;background:#020617;color:#e5e7eb;box-shadow:0 0 0 1px #1f2937 inset;font-size:13px;}"
+    "button{margin-top:12px;width:100%;padding:10px;border:none;border-radius:999px;background:#22c55e;color:#022c22;font-size:14px;cursor:pointer;}"
+    "button:hover{filter:brightness(1.08);}" 
+    ".bar-wrap{margin-top:14px;width:100%;height:10px;border-radius:999px;background:#020617;box-shadow:0 0 0 1px #1f2937 inset;overflow:hidden;}"
+    ".bar{height:100%;width:0%;background:#22c55e;transition:width .15s linear;}"
+    "#log{margin-top:14px;width:100%;height:140px;border-radius:12px;background:#020617;color:#e5e7eb;box-shadow:0 0 0 1px #1f2937 inset;font-size:11px;padding:8px;white-space:pre-wrap;overflow:auto;font-family:ui-monospace,monospace;}"
+    "a{color:#38bdf8;text-decoration:none;font-size:13px;}"
+    "</style>"
+    "</head><body><div class='card'>"
+    "<h2>Firmware OTA Update</h2>"
+    "<p>Upload file <b>.bin</b> hasil compile (Arduino &rarr; Export compiled binary). Jangan matikan ESP32 saat proses.</p>"
+    "<input type='file' id='fw' accept='.bin'>"
+    "<button onclick='startOta()'>Upload &amp; Update</button>"
+    "<div class='bar-wrap'><div id='bar' class='bar'></div></div>"
+    "<div id='log'></div>"
+    "<p><a href='/ir'>&larr; Kembali ke Home IR</a></p>"
+    "<script>"
+    "function log(msg){"
+      "var l=document.getElementById('log');"
+      "l.textContent += msg+'\\n';"
+      "l.scrollTop=l.scrollHeight;"
+    "}"
+    "function setProgress(p){"
+      "document.getElementById('bar').style.width=p+'%';"
+    "}"
+    "function startOta(){"
+      "var f=document.getElementById('fw').files;"
+      "if(!f||!f.length){log('Pilih file .bin terlebih dahulu.');return;}"
+      "var file=f[0];"
+      "log('Mulai upload: '+file.name+' ('+file.size+' bytes)');"
+      "setProgress(0);"
+      "var xhr=new XMLHttpRequest();"
+      "xhr.open('POST','/ir/update',true);"
+      "xhr.upload.onprogress=function(e){"
+        "if(e.lengthComputable){"
+          "var p=Math.round((e.loaded/e.total)*100);"
+          "setProgress(p);"
+        "}"
+      "};"
+      "xhr.onreadystatechange=function(){"
+        "if(xhr.readyState==4){"
+          "log('Respons: '+xhr.status+' '+xhr.responseText.trim());"
+          "if(xhr.status==200){"
+            "log('Jika update BERHASIL, ESP32 akan reboot otomatis...');"
+          "}"
+        "}"
+      "};"
+      "xhr.onerror=function(){log('Terjadi error koneksi saat upload.');};"
+      "var formData=new FormData();"
+      "formData.append('firmware',file);"
+      "xhr.send(formData);"
+    "}"
+    "</script>"
+    "</div></body></html>"
+  );
+  server.send(200, "text/html", html);
+}
+
+void handleIrFirmwareUpload() {
+  HTTPUpload &upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("OTA mulai: %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) {
+      Serial.printf("OTA sukses: %u bytes\n", upload.totalSize);
+    } else {
+      Update.printError(Serial);
+    }
+  }
+}
+
 // ---------- Setup & Loop ----------
 void setup(){
   Serial.begin(115200);
+
+  irsend.begin();
+
+  if (!SPIFFS.begin(true)) Serial.println("Gagal mount SPIFFS (IR data tidak tersedia)");
+  else { irLoadCodes(); irLoadSchedules(); irLoadSettings(); }
 
   // I2C (ubah jika SDA/SCL berbeda)
   Wire.begin(21,22);
@@ -592,7 +1310,7 @@ void setup(){
   }
 
   // RTC
-  if (!rtc.begin()) Serial.println("RTC DS1307 tidak terdeteksi!");
+  if (!rtc.begin()) Serial.println("RTC DS3231 tidak terdeteksi!");
   if (!rtc.isrunning()) Serial.println("RTC belum jalan / belum di-set. Akan diset saat NTP sukses.");
 
   // microSD
@@ -649,6 +1367,23 @@ void setup(){
   server.on("/data", HTTP_GET, handleData);
   server.on("/history", HTTP_GET, handleHistory);
   server.on("/daily.csv", HTTP_GET, handleDailyCSV);
+  server.on("/ir", handleIrRoot);
+  server.on("/ir/ac", handleIrAc);
+  server.on("/ir/save", HTTP_POST, handleIrSave);
+  server.on("/ir/delete", handleIrDelete);
+  server.on("/ir/savesched", HTTP_POST, handleIrSaveSchedule);
+  server.on("/ir/delsched", handleIrDeleteSchedule);
+  server.on("/ir/savesettings", HTTP_POST, handleIrSaveSettings);
+  server.on("/ir/update", HTTP_GET, handleIrUpdatePage);
+  server.on("/ir/update", HTTP_POST, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain",
+                (Update.hasError()) ? "Update GAGAL." : "Update BERHASIL. ESP32 akan reboot.");
+    delay(1000);
+    if (!Update.hasError()) {
+      ESP.restart();
+    }
+  }, handleIrFirmwareUpload);
   server.onNotFound([](){ server.send(404,"text/plain","Not found"); });
   server.begin();
   Serial.println("Web server dimulai. Akses http://192.168.0.200/");
@@ -657,6 +1392,7 @@ void setup(){
 void loop(){
   server.handleClient();
   ArduinoOTA.handle(); // penting untuk OTA
+  irRunSchedulesIfDue();
 
   // Logging ke Serial setiap 5 detik
   static unsigned long lastPrint = 0;
